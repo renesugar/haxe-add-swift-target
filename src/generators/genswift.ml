@@ -996,6 +996,16 @@ let generate con =
 				(params, String.concat " " params_extends)
 	in
 
+    let gen_field_decl w visibility v_n modifiers t n =
+			let parts = ref [] in
+			if visibility <> "" then parts := visibility :: !parts;
+			if v_n <> "" then parts := v_n :: !parts;
+			if modifiers <> [] then parts := modifiers @ !parts;
+			if t <> "" then parts := t :: !parts;
+			parts := n :: !parts;
+			write w (String.concat " " (List.rev !parts));
+    in
+
 	let write_parts w parts =
 		let parts = List.filter (fun s -> s <> "") parts in
 		write w (String.concat " " parts)
@@ -1123,14 +1133,15 @@ let generate con =
 		let visibility = (*if is_interface then "" else*) "public" in
 		let visibility, modifiers = get_fun_modifiers prop.cf_meta visibility [] in
 		let v_n = if is_static then "class" else if is_override && not is_interface then "override" else "" in
-		(*gen_nocompletion w prop.cf_meta*);
+		(*gen_nocompletion w prop.cf_meta;*)
 
+          (* THIS DOES NOT COMPILE __ FIXME
 		gen_field_decl w visibility v_n modifiers (t_s (run_follow gen t)) (change_field prop.cf_name);
-
+*)
 		let check cf = match cf with
 			| Some ({ cf_overloads = o :: _ } as cf) ->
-					gen.gcon.error "Property functions with more than one overload is currently unsupported" cf.cf_pos;
-					gen.gcon.error "Property functions with more than one overload is currently unsupported" o.cf_pos
+					gen.gcon.error "Property functions with more than one overload are currently unsupported" cf.cf_pos;
+					gen.gcon.error "Property functions with more than one overload are currently unsupported" o.cf_pos
 			| _ -> ()
 		in
 		check get;
@@ -1512,7 +1523,9 @@ let generate con =
 	if not (Common.defined gen.gcon Define.KeepOldOutput) then
 		clean_files (gen.gcon.file ^ "/Sources") !out_files gen.gcon.verbose;
     (*this next void return is necessary to compile when I comment out the block below.*)
-    ()
-
-	with TypeNotFound path -> con.error ("Error. Module '" ^ (s_type_path path) ^ "' is required and was not included in build.") null_pos);
-	debug_mode := false
+    ();
+    
+    (*this try block started 1400 lines ago.  Really?*)
+    with TypeNotFound path -> con.error ("Error. Module '" ^ (s_type_path path) ^ "' is required and was not included in build.") null_pos);
+    debug_mode := false; 
+    
