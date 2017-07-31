@@ -565,7 +565,9 @@ let generate con =
 			let was_in_value = !in_value in
 			in_value := true;
 			match e.eexpr with
-				| TConst c ->
+                (* TODO TEnumIndex and TIdent were added to make the compiler shut up.  FIXME*)
+                | (TEnumIndex _|TIdent _) -> ()
+                | TConst c ->
 					(match c with
 						| TInt i32 ->
 							print w "%ld" i32;
@@ -1010,9 +1012,11 @@ let generate con =
 				(path_s path cl.cl_meta) ^ "." ^ fn_name, false, true
 			| name -> name, false, false
 		in
+    let is_extern_field f = not (Type.is_physical_field f) || Meta.has Meta.Extern f.cf_meta
+        in
 		(match cf.cf_kind with
             | Var _
-			| Method (MethDynamic) when not (Type.is_extern_field cf) ->
+			| Method (MethDynamic) when not (is_extern_field cf) ->
 				(if is_overload || List.exists (fun cf -> cf.cf_expr <> None) cf.cf_overloads then
 					gen.gcon.error "Only normal (non-dynamic) methods can be overloaded" cf.cf_pos);
 				if not is_interface then begin
@@ -1025,7 +1029,7 @@ let generate con =
 						| None -> ()
 					)
 				end (* TODO see how (get,set) variable handle when they are interfaces *)
-			| Method _ when Type.is_extern_field cf || (match cl.cl_kind, cf.cf_expr with | KAbstractImpl _, None -> true | _ -> false) ->
+			| Method _ when is_extern_field cf || (match cl.cl_kind, cf.cf_expr with | KAbstractImpl _, None -> true | _ -> false) ->
 				List.iter (fun cf -> if cl.cl_interface || cf.cf_expr <> None then
 					gen_class_field w ~is_overload:true is_static cl (Meta.has Meta.Final cf.cf_meta) cf
 				) cf.cf_overloads
