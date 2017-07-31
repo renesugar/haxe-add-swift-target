@@ -135,7 +135,7 @@ let is_to_string t =
 	| _ -> false
 
 let is_extern_field f =
-	Type.is_extern_field f || (match f.cf_kind with Method MethNormal -> List.exists (fun (m,_,_) -> m = Meta.Custom ":hlNative") f.cf_meta | _ -> false) || Meta.has Meta.Extern f.cf_meta
+	not (Type.is_physical_field f) || (match f.cf_kind with Method MethNormal -> List.exists (fun (m,_,_) -> m = Meta.Custom ":hlNative") f.cf_meta | _ -> false) || Meta.has Meta.Extern f.cf_meta
 
 let is_array_class name =
 	match name with
@@ -334,6 +334,12 @@ let make_debug ctx arr =
 	done;
 	out
 
+let fake_tnull =
+	{null_abstract with
+		a_path = [],"Null";
+		a_params = ["T",t_dynamic];
+	}
+
 let rec to_type ?tref ctx t =
 	match t with
 	| TMono r ->
@@ -353,7 +359,6 @@ let rec to_type ?tref ctx t =
 			t
 		) in
 		(match td.t_path with
-		| [], "Null" when not (is_nullable t) -> HNull t
 		| ["haxe";"macro"], name -> Hashtbl.replace ctx.macro_typedefs name t; t
 		| _ -> t)
 	| TLazy f ->
@@ -425,6 +430,9 @@ let rec to_type ?tref ctx t =
 			in
 			loop tl
 		| _ -> class_type ~tref ctx c pl false)
+	| TAbstract ({a_path = [],"Null"},[t1]) ->
+		let t = to_type ?tref ctx t1 in
+		if not (is_nullable t) then HNull t else t
 	| TAbstract (a,pl) ->
 		if Meta.has Meta.CoreType a.a_meta then
 			(match a.a_path with
@@ -487,14 +495,24 @@ and real_type ctx e =
 		match e.eexpr with
 		| TField (_,f) ->
 			let ft = field_type ctx f e.epos in
-			(*
-				Handle function variance:
-				If we have type parameters which are function types, we need to keep the functions
-				because we might need to insert a cast to coerce Void->Bool to Void->Dynamic for instance.
-			*)
 			(match ft, e.etype with
 			| TFun (args,ret), TFun (args2,_) ->
-				TFun (List.map2 (fun ((_,_,t) as a) ((_,_,t2) as a2) -> match t, t2 with TInst ({cl_kind=KTypeParameter _},_), TFun _ -> a2 | _ -> a) args args2, ret)
+				TFun (List.map2 (fun ((name,opt,t) as a) ((_,_,t2) as a2) ->
+					match t, t2 with
+					(*
+						Handle function variance:
+						If we have type parameters which are function types, we need to keep the functions
+						because we might need to insert a cast to coerce Void->Bool to Void->Dynamic for instance.
+					*)
+					| TInst ({cl_kind=KTypeParameter _},_), TFun _ -> a2
+					(*
+						If we have a number, it is more accurate to cast it to the type parameter before wrapping it as dynamic
+					*)
+					| TInst ({cl_kind=KTypeParameter _},_), t when is_number (to_type ctx t) ->
+						(name, opt, TAbstract (fake_tnull,[t]))
+					| _ ->
+						a
+				) args args2, ret)
 			| _ -> ft)
 		| TLocal v -> v.v_type
 		| TParenthesis e -> loop e
@@ -1146,6 +1164,14 @@ and unsafe_cast_to ctx (r:reg) (t:ttype) p =
 		if is_dynamic (rtype ctx r) && is_dynamic t then
 			let r2 = alloc_tmp ctx t in
 			op ctx (OUnsafeCast (r2,r));
+			if ctx.com.debug then begin
+				hold ctx r2;
+				let r3 = cast_to ~force:true ctx r t p in
+				let j = jump ctx (fun n -> OJEq (r2,r3,n)) in
+				op ctx (OAssert 0);
+				j();
+				free ctx r2;
+			end;
 			r2
 		else
 			cast_to ~force:true ctx r t p
@@ -1489,9 +1515,9 @@ and eval_expr ctx e =
 				r
 			)
 		| _ -> assert false);
-	| TCall ({ eexpr = TLocal v }, el) when v.v_name.[0] = '$' ->
+	| TCall ({ eexpr = TIdent s }, el) when s.[0] = '$' ->
 		let invalid() = abort "Invalid native call" e.epos in
-		(match v.v_name, el with
+		(match s, el with
 		| "$new", [{ eexpr = TTypeExpr (TClassDecl _) }] ->
 			(match follow e.etype with
 			| TInst (c,pl) ->
@@ -1761,8 +1787,12 @@ and eval_expr ctx e =
 		| "$aset", [a; pos; value] ->
 			let et = (match follow a.etype with TAbstract ({ a_path = ["hl"],"NativeArray" },[t]) -> to_type ctx t | _ -> invalid()) in
 			let arr = eval_to ctx a HArray in
+			hold ctx arr;
 			let pos = eval_to ctx pos HI32 in
+			hold ctx pos;
 			let r = eval_to ctx value et in
+			free ctx pos;
+			free ctx arr;
 			op ctx (OSetArray (arr, pos, r));
 			r
 		| "$abytes", [a] ->
@@ -1807,6 +1837,17 @@ and eval_expr ctx e =
 			let out = alloc_tmp ctx (match rtype ctx r with HRef t -> t | _ -> invalid()) in
 			op ctx (OUnref (out,r));
 			out
+		| "$refdata", [e1] ->
+			let v = eval_expr ctx e1 in
+			let r = alloc_tmp ctx (match to_type ctx e.etype with HRef _ as t -> t | _ -> invalid()) in
+			op ctx (ORefData (r,v));
+			r
+		| "$refoffset", [r;e1] ->
+			let r = eval_expr ctx r in
+			let e = eval_to ctx e1 HI32 in
+			let r2 = alloc_tmp ctx (match rtype ctx r with HRef _ as t -> t | _ -> invalid()) in
+			op ctx (ORefOffset (r2,r,e));
+			r2
 		| "$ttype", [v] ->
 			let r = alloc_tmp ctx HType in
 			op ctx (OType (r,to_type ctx v.etype));
@@ -1880,7 +1921,9 @@ and eval_expr ctx e =
 			free ctx min;
 			r
 		| _ ->
-			abort ("Unknown native call " ^ v.v_name) e.epos)
+			abort ("Unknown native call " ^ s) e.epos)
+	| TEnumIndex v ->
+		get_enum_index ctx v
 	| TCall ({ eexpr = TField (_,FStatic ({ cl_path = [],"Type" },{ cf_name = "enumIndex" })) },[{ eexpr = TCast(v,_) }]) when (match follow v.etype with TEnum _ -> true | _ -> false) ->
 		get_enum_index ctx v
 	| TCall ({ eexpr = TField (_,FStatic ({ cl_path = [],"Type" },{ cf_name = "enumIndex" })) },[v]) when (match follow v.etype with TEnum _ -> true | _ -> false) ->
@@ -1937,7 +1980,28 @@ and eval_expr ctx e =
 			op ctx (OCallClosure (ret, r, el)); (* if it's a value, it's a closure *)
 			def_ret := Some (cast_to ~force:true ctx ret (to_type ctx e.etype) e.epos);
 		);
-		(match !def_ret with None -> cast_to ~force:true ctx ret (to_type ctx e.etype) e.epos | Some r -> r)
+		(match !def_ret with
+		| None ->
+			let rt = to_type ctx e.etype in
+			let is_valid_method t =
+				match follow t with
+				| TFun (_,rt) ->
+					(match follow rt with
+					| TInst({ cl_kind = KTypeParameter tl },_) ->
+						(* don't allow if we have a constraint virtual, see hxbit.Serializer.getRef *)
+						not (List.exists (fun t -> match to_type ctx t with HVirtual _ -> true | _ -> false) tl)
+					| _ -> false)
+				| _ ->
+					false
+			in
+			(match ec.eexpr with
+			| TField (_, FInstance(_,_,{ cf_kind = Method (MethNormal|MethInline); cf_type = t })) when is_valid_method t ->
+				(* let's trust the compiler when it comes to casting the return value from a type parameter *)
+				unsafe_cast_to ctx ret rt e.epos
+			| _ ->
+				cast_to ~force:true ctx ret rt e.epos)
+		| Some r ->
+			r)
 	| TField (ec,FInstance({ cl_path = [],"Array" },[t],{ cf_name = "length" })) when to_type ctx t = HDyn ->
 		let r = alloc_tmp ctx HI32 in
 		op ctx (OCall1 (r,alloc_fun_path ctx (["hl";"types"],"ArrayDyn") "get_length", eval_null_check ctx ec));
@@ -2389,9 +2453,9 @@ and eval_expr ctx e =
 		ctx.m.mcontinues <- oldc;
 		ctx.m.mloop_trys <- oldtrys;
 		alloc_tmp ctx HVoid
-	| TCast ({ eexpr = TCast (v,_) },a) ->
+	| TCast ({ eexpr = TCast (v,None) },None) when not (is_number (to_type ctx e.etype)) ->
         (* coalesce double casts into a single runtime check - temp fix for Map accesses *)
-        eval_expr ctx { e with eexpr = TCast(v,a) }
+        eval_expr ctx { e with eexpr = TCast(v,None) }
 	| TCast (v,None) ->
 		let t = to_type ctx e.etype in
 		let rv = eval_expr ctx v in
@@ -2653,6 +2717,8 @@ and eval_expr ctx e =
 		else
 			op ctx (OSafeCast (r,re));
 		r
+	| TIdent s ->
+		assert false
 
 and gen_assign_op ctx acc e1 f =
 	let f r =
@@ -3351,7 +3417,7 @@ let write_code ch code debug =
 		let oid = Obj.tag o in
 
 		match op with
-		| OLabel _ | ONop _ ->
+		| OLabel _ | ONop _ | OAssert _ ->
 			byte oid
 		| OCall2 (r,g,a,b) ->
 			byte oid;
@@ -3719,7 +3785,7 @@ let generate com =
 		Hlcode.dump (fun s -> output_string ch (s ^ "\n")) code;
 		close_out ch;
 	end;
-	if Common.raw_defined com "hl-dump-spec" then begin
+	(*if Common.raw_defined com "hl-dump-spec" then begin
 		let ch = open_out_bin "dump/hlspec.txt" in
 		let write s = output_string ch (s ^ "\n") in
 		Array.iter (fun f ->
@@ -3729,7 +3795,7 @@ let generate com =
 			write "";
 		) code.functions;
 		close_out ch;
-	end;
+	end;*)
 	if Common.raw_defined com "hl-check" then begin
 		check ctx;
 		Hlinterp.check code false;

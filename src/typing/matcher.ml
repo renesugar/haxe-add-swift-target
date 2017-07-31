@@ -360,7 +360,10 @@ module Pattern = struct
 						PMap.fold (fun cf acc -> (cf,cf.cf_type) :: acc) an.a_fields []
 					| TInst(c,tl) ->
 						let rec loop fields c tl =
-							let fields = List.fold_left (fun acc cf -> (cf,apply_params c.cl_params tl cf.cf_type) :: acc) fields c.cl_ordered_fields in
+							let fields = List.fold_left (fun acc cf ->
+								if Typer.can_access ctx c cf false then (cf,apply_params c.cl_params tl cf.cf_type) :: acc
+								else acc
+							) fields c.cl_ordered_fields in
 							match c.cl_super with
 								| None -> fields
 								| Some (csup,tlsup) -> loop fields csup (List.map (apply_params c.cl_params tl) tlsup)
@@ -403,10 +406,18 @@ module Pattern = struct
 					pctx.current_locals <- PMap.add name (v,p) pctx.current_locals
 				) pctx1.current_locals;
 				PatOr(pat1,pat2)
-			| EBinop(OpAssign,(EConst (Ident s),p),e2) ->
-				let pat = make pctx t e2 in
-				let v = add_local s p in
-				PatBind(v,pat)
+			| EBinop(OpAssign,e1,e2) ->
+				let rec loop in_display e = match e with
+					| (EConst (Ident s),p) ->
+						let v = add_local s p in
+						if in_display then ignore(Typer.display_expr ctx e (mk (TLocal v) v.v_type p) (WithType t) p);
+						let pat = make pctx t e2 in
+						PatBind(v,pat)
+					| (EParenthesis e1,_) -> loop in_display e1
+					| (EDisplay(e1,_),_) -> loop true e1
+					| _ -> fail()
+					in
+					loop false e1
 			| EBinop(OpArrow,e1,e2) ->
 				let v = add_local "_" null_pos in
 				let e1 = type_expr ctx e1 Value in
@@ -1035,23 +1046,25 @@ module Compile = struct
 		let pat_any = (PatAny,null_pos) in
 		let _,_,ex_subjects,cases,bindings = List.fold_left2 (fun (left,right,subjects,cases,ex_bindings) (case,bindings,patterns) extractor -> match extractor,patterns with
 			| Some(v,e1,pat,vars), _ :: patterns ->
-				let patterns = make_offset_list (left + 1) (right - 1) pat pat_any @ patterns in
 				let rec loop e = match e.eexpr with
 					| TLocal v' when v' == v -> subject
 					| _ -> Type.map_expr loop e
 				in
 				let e1 = loop e1 in
 				let bindings = List.map (fun v -> v,subject.epos,subject) vars @ bindings in
-				let v,ex_bindings = try
-					let v,_,_ = List.find (fun (_,_,e2) -> Texpr.equal e1 e2) ex_bindings in
-					v,ex_bindings
+				begin try
+					let v,_,_,left,right = List.find (fun (_,_,e2,_,_) -> Texpr.equal e1 e2) ex_bindings in
+					let ev = mk (TLocal v) v.v_type e1.epos in
+					let patterns = make_offset_list (left + 1) (right - 1) pat pat_any @ patterns in
+					(left + 1, right - 1,ev :: subjects,((case,bindings,patterns) :: cases),ex_bindings)
 				with Not_found ->
 					let v = alloc_var "_hx_tmp" e1.etype e1.epos in
 					v.v_meta <- (Meta.Custom ":extractorVariable",[],v.v_pos) :: v.v_meta;
-					v,(v,e1.epos,e1) :: ex_bindings
-				in
-				let ev = mk (TLocal v) v.v_type e1.epos in
-				(left + 1, right - 1,ev :: subjects,((case,bindings,patterns) :: cases),ex_bindings)
+					let ex_bindings = (v,e1.epos,e1,left,right) :: ex_bindings in
+					let patterns = make_offset_list (left + 1) (right - 1) pat pat_any @ patterns in
+					let ev = mk (TLocal v) v.v_type e1.epos in
+					(left + 1, right - 1,ev :: subjects,((case,bindings,patterns) :: cases),ex_bindings)
+				end
 			| None,pat :: patterns ->
 				let patterns = make_offset_list 0 num_extractors pat pat_any @ patterns in
 				(left,right,subjects,((case,bindings,patterns) :: cases),ex_bindings)
@@ -1059,6 +1072,7 @@ module Compile = struct
 				assert false
 		) (0,num_extractors,[],[],[]) cases (List.rev extractors) in
 		let dt = compile mctx ((subject :: List.rev ex_subjects) @ subjects) (List.rev cases) in
+		let bindings = List.map (fun (a,b,c,_,_) -> (a,b,c)) bindings in
 		bind mctx bindings dt
 
 	let compile ctx match_debug subjects cases p =
@@ -1255,8 +1269,7 @@ module TexprConverter = struct
 				   (correctly typed) neutral value because it doesn't actually matter. *)
 				mk (TConst (TInt (Int32.of_int 0))) ctx.t.tint e.epos
 			else
-				let cf = PMap.find "enumIndex" c_type.cl_statics in
-				make_static_call ctx c_type cf (fun t -> t) [e] com.basic.tint e.epos
+				mk (TEnumIndex e) com.basic.tint e.epos
 		in
 		let mk_name_call e =
 			if not ctx.in_macro && not ctx.com.display.DisplayMode.dms_full_typing then
