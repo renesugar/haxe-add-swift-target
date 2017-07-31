@@ -1104,6 +1104,66 @@ let generate con =
 			newline w
 	in
 
+    let rec gen_prop w is_static cl is_final (prop,t,get,set) =
+	    (*gen_attributes w prop.cf_meta;*)
+		let is_interface = cl.cl_interface in
+		(*let fn_is_final = function
+			| None -> true
+			| Some ({ cf_kind = Method mkind } as m) ->
+				(match mkind with | MethInline -> true | _ -> false) || Meta.has Meta.Final m.cf_meta
+			| _ -> assert false
+		in
+		let is_virtual = not (is_interface || is_final || Meta.has Meta.Final prop.cf_meta || fn_is_final get || fn_is_final set) in*)
+
+		let fn_is_override = function
+			| Some cf -> List.memq cf cl.cl_overrides
+			| None -> false
+		in
+		let is_override = fn_is_override get || fn_is_override set in
+		let visibility = (*if is_interface then "" else*) "public" in
+		let visibility, modifiers = get_fun_modifiers prop.cf_meta visibility [] in
+		let v_n = if is_static then "class" else if is_override && not is_interface then "override" else "" in
+		(*gen_nocompletion w prop.cf_meta*);
+
+		gen_field_decl w visibility v_n modifiers (t_s (run_follow gen t)) (change_field prop.cf_name);
+
+		let check cf = match cf with
+			| Some ({ cf_overloads = o :: _ } as cf) ->
+					gen.gcon.error "Property functions with more than one overload is currently unsupported" cf.cf_pos;
+					gen.gcon.error "Property functions with more than one overload is currently unsupported" o.cf_pos
+			| _ -> ()
+		in
+		check get;
+		check set;
+
+		write w " ";
+		if is_interface then begin
+			write w "{ ";
+			let s = ref "" in
+			(match prop.cf_kind with Var { v_read = AccCall } -> write w "get;"; s := " "; | _ -> ());
+			(match prop.cf_kind with Var { v_write = AccCall } -> print w "%sset;" !s | _ -> ());
+			write w " }";
+			newline w;
+		end else begin
+			begin_block w;
+			(match get with
+				| Some cf ->
+					print w "get { return _get_%s(); }" prop.cf_name;
+					newline w;
+					cf.cf_meta <- (Meta.Custom "?prop_impl", [], null_pos) :: cf.cf_meta;
+				| None -> ());
+			(match set with
+				| Some cf ->
+					print w "set { _set_%s(value); }" prop.cf_name;
+					newline w;
+					cf.cf_meta <- (Meta.Custom "?prop_impl", [], null_pos) :: cf.cf_meta;
+				| None -> ());
+			end_block w;
+			newline w;
+			newline w;
+		end;
+	in		
+
 	let gen_class w cl =
 		let should_close = match change_ns (fst cl.cl_path) with
 			| [] -> false
@@ -1184,12 +1244,12 @@ let generate con =
 		in
 		loop cl.cl_meta;
 
-(* collect properties and events *)
+        (* collect properties *)
         let partition cf cflist =
 			let props, nonprops = ref [], ref [] in
 
             List.iter (fun v -> match v.cf_kind with
-				| Var { v_read = AccCall } | Var { v_write = AccCall } (*when Type.is_extern_field v && Meta.has Meta.Property v.cf_meta*) ->
+				| Var { v_read = AccCall } | Var { v_write = AccCall } ->
 					props := (v.cf_name, ref (v, v.cf_type, None, None)) :: !props;
 				| _ ->
 					nonprops := v :: !nonprops;
@@ -1197,21 +1257,10 @@ let generate con =
 
 			let nonprops = !nonprops in
 
-			(*let t = TInst(cl, List.map snd cl.cl_params) in*)
 			let find_prop name = try
 					List.assoc name !props
-				with | Not_found -> (*match field_access gen t name with
-					| FClassField (_,_,decl,v,_,t,_) when is_extern_prop (TInst(cl,List.map snd cl.cl_params)) name ->
-						let ret = ref (v,t,None,None) in
-						props := (name, ret) :: !props;
-						ret
-					| _ ->*) raise Not_found
+				with | Not_found -> raise Not_found
 			in
-
-			(*let is_empty_function cf = match cf.cf_expr with
-				| Some {eexpr = TFunction { tf_expr = {eexpr = TBlock []}}} -> true
-				| _ -> false
-			in*)
 
 			let interf = cl.cl_interface in
 			(* get all functions that are getters/setters *)
